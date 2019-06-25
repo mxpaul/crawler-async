@@ -12,3 +12,4 @@ cover_db
 *.swp
 *.src.rpm
 /tmp
+/docker/mysql/data/*

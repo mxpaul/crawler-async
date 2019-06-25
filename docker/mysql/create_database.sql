@@ -1,0 +1,7 @@
+CREATE TABLE arts (
+  id INT NOT NULL,
+  title TEXT NOT NULL,
+  author TEXT NOT NULL,
+  hash TEXT,
+  PRIMARY KEY (id)
+) ENGINE=INNODB;

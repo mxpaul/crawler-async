@@ -1,0 +1,24 @@
+# Use root/example as user/password credentials
+version: '3.1'
+
+services:
+
+  db:
+    #image: mysql:8.0.16
+    image: mysql
+    command: --default-authentication-plugin=mysql_native_password
+    #--mysqlx_enable_hello_notice=false
+    restart: always
+    #network_mode: "host"
+    ports:
+      - "33060:3306"
+    volumes:
+      - ./mysql/conf.d:/etc/mysql/conf.d
+      - ./mysql/secrets:/run/secrets
+      - ./mysql/data:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql-test-root-passwd.txt
+      MYSQL_DATABASE: artfake
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql-test-user-passwd.txt
+      MYSQL_USER: crawler
+
