@@ -4,6 +4,80 @@ use warnings;
 use utf8;
 
 # ----------------------
+package Local::ArtStorage;
+
+use Mouse;
+use Carp;
+use AnyEvent::MySQL;
+
+has dbh => ( is => 'rw', );
+has host => ( is => 'rw', required => 1);
+has port => ( is => 'rw', required => 1);
+has user => ( is => 'rw', required => 1);
+has password => ( is => 'rw', required => 1);
+has database => ( is => 'rw', required => 1);
+
+has on_connect => (is => 'rw', );
+has on_disconnect => (is => 'rw', );
+
+has ready => ( is => 'rw' );
+
+sub data_source { my $self = shift;
+  return sprintf('DBI:mysql:database=%s;host=%s;port=%d', @{$self}{qw(database host port)});
+}
+
+sub connect { my $self = shift;
+  croak "protect from double connect call" if $self->dbh;
+  $self->{ready} = 0;
+  $self->{dbh} = AnyEvent::MySQL->connect(
+    $self->data_source,
+    $self->user,
+    $self->password,
+    { PrintError => 1, Verbose => 1},
+    sub { my $dbh = shift;
+      if (defined $dbh) {
+        $self->{ready} = 1;
+        $self->{on_connect}->($dbh) if ref $self->{on_connect} eq 'CODE';
+      } else {
+        $self->{ready} = 0;
+        $self->{on_disconnect}->() if ref $self->{on_disconnect} eq 'CODE';
+      }
+    },
+  );
+}
+
+sub upsert_art { my $self = shift;
+  my $cb = pop or croak 'want cb';
+  my $art = shift;
+  my $ctx = shift;
+
+  if (! $self->{ready}) {
+    $cb->({error => 'mysql not ready'});
+    return;
+  }
+
+  $ctx->debug('enter upsert_art');
+  croak 'broken art' if ! defined $art->{id};
+  my @sql_param = ($art->{id},
+    (map { my $s = $art->{$_}//''; utf8::encode($s) if utf8::is_utf8($s); $s} qw(author title hash))
+  );
+  $self->{dbh}->do("replace into arts(id,author, title, hash) values (?,?,?,?)", {},
+    @sql_param,
+    sub { my $rv = shift;
+      if (defined $rv) {
+        $cb->({error => 0, fatal => 0});
+      } else {
+        $cb->({
+          error => "upsert_art replace failed: $AnyEvent::MySQL::errstr ($AnyEvent::MySQL::err)",
+          fatal => 0
+        });
+      }
+    }
+  );
+
+}
+
+# ----------------------
 package Local::Ctx;
 
 sub cur_rss {
@@ -18,6 +92,7 @@ our $DEBUG = 1;
 
 has queue => ( is => 'rw', required => 1);
 has stat => ( is => 'rw', required => 1);
+has artstor => ( is => 'rw', required => 1);
 has ident => (is => 'rw', default => '' );
 has created => (is => 'rw', default => sub { time } );
 has start_rrs => (is => 'rw', default => sub { cur_rss; } );
@@ -176,7 +251,7 @@ sub work { my $self = shift;
   $ctx->debug("go GET", $url);
   my $resp = {error => 0, fatal => 0};
   $ctx->stat->add('task_art_start');
-  my $cb = sub { $ctx->stat->add('task_art_stop'); goto &$caller_cb};
+  my $cb = sub { $ctx->stat->add('task_art_stop'); goto &$caller_cb };
 
   $self->fetchXMLdoc($url, $ctx, sub {
     my $res = shift;
@@ -193,28 +268,57 @@ sub work { my $self = shift;
       }
 
       my $art = $self->art_data_to_art($match, $ctx);
+      my $art_log_ident = sprintf('[%s] A="%s" T="%s"',
+        map { $art->{$_}//'None' } qw(id author title)
+      );
       if ($art->{link}) {
         $ctx->stat->add('art_with_link');
         $self->get_demo_hash($art->{link}, $ctx, sub {
           my $res = shift;
           if ($res->{error}) {
             $ctx->stat->add('task_art_hash_fail');
-            $ctx->error(sprintf('error get demo hash url=[%s]: %s', $res->{error}));
+            $resp->{error} = sprintf('error get demo hash %s url=[%s]: %s', $art_log_ident, $res->{error});
+            $ctx->error($resp->{error});
             $cb->($resp);
           } else {
+
             $art->{hash} = $res->{hash};
+
             $ctx->stat->add('task_art_ok');
             $ctx->stat->add('task_art_hash_ok');
-            $ctx->info(sprintf('art ready: [%s] A="%s" T="%s" HASH="%s" DL=%s',
-              map { $art->{$_}//'None' } qw(id author title hash link),
+            $ctx->info(sprintf('art hash found %s HASH="%s" DL=%s', $art_log_ident,
+              map { $art->{$_}//'None' } qw(hash link),
             ));
-            $cb->($resp);
+
+            $ctx->artstor->upsert_art($art, $ctx, sub { # Store art
+              my $res = shift;
+              if ($res->{error}) {
+                $resp->{error} = sprintf('error save art to storage: %s', $res->{error});
+                $ctx->error($resp->{error});
+                $cb->($resp);
+              } else {
+                $ctx->info(sprintf('art hash saved %s HASH="%s" DL=%s', $art_log_ident,
+                  map { $art->{$_}//'None' } qw(hash link),
+                ));
+                $cb->($resp);
+              }
+            });
           }
         });
       } else {
         $ctx->stat->add('task_art_ok');
         $ctx->stat->add('art_nolink');
-        $cb->($resp);
+        $ctx->artstor->upsert_art($art, $ctx, sub { # Store art
+          my $res = shift;
+          if ($res->{error}) {
+            $resp->{error} = sprintf('error save art to storage: %s', $res->{error});
+            $ctx->error($resp->{error});
+            $cb->($resp);
+          } else {
+            $ctx->info(sprintf('art saved %s', $art_log_ident,));
+            $cb->($resp);
+          }
+        });
       }
     }
   });
@@ -349,9 +453,37 @@ use EV;
 use AnyEvent;
 use AnyEvent::HTTP;
 use Time::HiRes qw(time);
+use Getopt::Long;
 
 #use JSON::XS;
 #our $JSON=JSON::XS->new->utf8;
+
+my $opt = {
+  host => '127.0.0.1',
+  port => 33060,
+  user => 'crawler',
+  database => 'artfake',
+};
+
+GetOptions ($opt,
+  'host=s',
+  'port=i',
+  'user=s',
+  'database=s',
+  'password-file=s',
+) or die "Invalid command line\n";
+
+die "want --password-file=<path/to//mysql-test-user-passwd.txt>" unless $opt->{'password-file'};
+stat $opt->{'password-file'};
+if (!-f _ || ! -r _ ) {
+  die sprintf('--password-file should point to readable file, "%s" is given', $opt->{'password-file'});
+}
+
+open my $f, '<', $opt->{'password-file'} or die "password file open error: $!";
+$opt->{password} = <$f>;
+close $f;
+chomp $opt->{password};
+die "password should not be empty" unless length($opt->{password}) > 0;
 
 
 $AnyEvent::HTTP::USERAGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36';
@@ -359,13 +491,13 @@ $AnyEvent::HTTP::USERAGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
 my $queue = Local::Queue->new();
 # Last page 10764
 $queue->push(
-  #{type => 'Local::LitRes::ListingPage', page_id => 2500},
-  {type => 'Local::LitRes::ListingPage', page_id => 10766},
+  {type => 'Local::LitRes::ListingPage', page_id => 1},
+  #{type => 'Local::LitRes::ListingPage', page_id => 10766},
   ##{type => 'Local::LitRes::ArtPage', url => 'https://www.litres.ru/pavel-ardashev/peterburgskie-otgoloski/'},
   ##{type => 'Local::LitRes::ArtPage', url => 'https://www.litres.ru/maks-fray/tyazhelyy-svet-kurteyna-zheltyy/'},
   ##{type => 'Local::LitRes::ArtPage', url => 'https://www.litres.ru/ludmila-nevzgodina/udivitelnye-novogodnie-igrushki-i-suveniry-sozdaem-svoimi-rukami/'}, # Нет в продаже
   ##{type => 'Local::LitRes::ArtPage', url => 'https://www.litres.ru/ieromonah-serafim-rouz/sovremennoe-nedochelovechestvo/'}, # Аудио
-  ##{type => 'Local::LitRes::ArtPage', url => 'https://www.litres.ru/vissarion-belinskiy/nadezhda-sobranie-sochineniy-v-stihah-i-proze-izd-a-kulchickiy/'},
+  #{type => 'Local::LitRes::ArtPage', url => 'https://www.litres.ru/vissarion-belinskiy/nadezhda-sobranie-sochineniy-v-stihah-i-proze-izd-a-kulchickiy/'},
 );
 
 
@@ -373,15 +505,17 @@ my $MAX_PAGE_FAIL_COUNT = 3;
 
 $Local::Ctx::DEBUG = 1;
 
-my $max_parallel = 6;
+my $max_parallel = 20;
 my $running = 0;
 my $task_max_retry_on_fail = 2;
 
 my $stat = Local::Stat->new();
+my $storage = Local::ArtStorage->new(map { $_ => $opt->{$_}} qw(host port user password database));
 
 my $process_queue; $process_queue = sub {
   warn sprintf("Stat: %s Running: [%d/%d]", $stat->asString, $running, $max_parallel);
 
+  return unless $storage->ready;
   return unless $running < $max_parallel;
   my $task = $queue->nextTask();
   unless ($task) {
@@ -390,7 +524,7 @@ my $process_queue; $process_queue = sub {
   }
 
   my $type = $task->{type};
-  my $ctx = Local::Ctx->new(queue => $queue, stat => $stat );
+  my $ctx = Local::Ctx->new(queue => $queue, stat => $stat, artstor => $storage );
   $ctx->cur_rss;
   $stat->add('task_started');
   my $worker = $type->new(task => $task, ctx => $ctx);
@@ -417,6 +551,9 @@ my $process_queue; $process_queue = sub {
 
 }; $process_queue->();
 
+
+$storage->on_connect($process_queue);
+$storage->connect();
 EV::loop;
 warn sprintf("Done. Stat: %s", $stat->asString);
 
